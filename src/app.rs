@@ -1,6 +1,7 @@
 use crate::collector::{MultiCollector, read_rate_limits};
 use crate::model::{AgentSession, OrphanPort, RateLimitInfo, SessionStatus};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Write;
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -51,6 +52,10 @@ pub struct App {
     pub orphan_ports: Vec<OrphanPort>,
     /// Transient status message shown in the footer (auto-clears after 3s).
     pub status_msg: Option<(String, Instant)>,
+    /// Previous session statuses for bell transition detection, keyed by (agent_cli, session_id).
+    prev_states: HashMap<(String, String), SessionStatus>,
+    /// Previous rate limit percentages for bell threshold detection, keyed by source name.
+    prev_rate_pcts: HashMap<String, f64>,
 }
 
 impl App {
@@ -74,6 +79,8 @@ impl App {
             summary_tx: tx,
             orphan_ports: Vec::new(),
             status_msg: None,
+            prev_states: HashMap::new(),
+            prev_rate_pcts: HashMap::new(),
         }
     }
 
@@ -88,6 +95,24 @@ impl App {
         self.orphan_ports = self.collector.orphan_ports.clone();
         if self.selected >= self.sessions.len() && !self.sessions.is_empty() {
             self.selected = self.sessions.len() - 1;
+        }
+
+        // --- Terminal bell on state transitions ---
+        let mut should_bell = false;
+
+        for s in &self.sessions {
+            let key = (s.agent_cli.to_string(), s.session_id.clone());
+            if let Some(prev) = self.prev_states.get(&key) {
+                // Working → Waiting (agent finished, needs input)
+                if matches!(prev, SessionStatus::Working) && matches!(s.status, SessionStatus::Waiting) {
+                    should_bell = true;
+                }
+                // Any → Error
+                if !matches!(prev, SessionStatus::Error(_)) && matches!(s.status, SessionStatus::Error(_)) {
+                    should_bell = true;
+                }
+            }
+            self.prev_states.insert(key, s.status.clone());
         }
 
         // Compute rate as sum of per-session deltas (stable across session churn).
@@ -116,8 +141,25 @@ impl App {
             if let Some(codex_rl) = self.collector.codex_rate_limit() {
                 self.rate_limits.push(codex_rl.clone());
             }
+
+            // Rate limit threshold crossing (any 5h window crossing 80%)
+            for rl in &self.rate_limits {
+                if let Some(pct) = rl.five_hour_pct {
+                    let prev = self.prev_rate_pcts.get(&rl.source).copied().unwrap_or(0.0);
+                    if pct >= 80.0 && prev < 80.0 {
+                        should_bell = true;
+                    }
+                    self.prev_rate_pcts.insert(rl.source.clone(), pct);
+                }
+            }
         } else {
             self.rate_limit_counter += 1;
+        }
+
+        // Emit terminal bell on actionable state transitions
+        if should_bell {
+            let _ = std::io::stdout().write_all(b"\x07");
+            let _ = std::io::stdout().flush();
         }
 
         self.drain_and_retry_summaries();
