@@ -51,6 +51,12 @@ pub struct App {
     pub orphan_ports: Vec<OrphanPort>,
     /// Transient status message shown in the footer (auto-clears after 3s).
     pub status_msg: Option<(String, Instant)>,
+    /// Previous session statuses for alert transition detection, keyed by (agent_cli, session_id).
+    prev_states: HashMap<(String, String), SessionStatus>,
+    /// Previous rate limit percentages for threshold crossing alerts, keyed by source name.
+    prev_rate_pcts: HashMap<String, f64>,
+    /// Sessions that have already triggered a context >= 90% alert (hysteresis at 85%).
+    alerted_contexts: HashSet<String>,
 }
 
 impl App {
@@ -74,6 +80,9 @@ impl App {
             summary_tx: tx,
             orphan_ports: Vec::new(),
             status_msg: None,
+            prev_states: HashMap::new(),
+            prev_rate_pcts: HashMap::new(),
+            alerted_contexts: HashSet::new(),
         }
     }
 
@@ -88,6 +97,35 @@ impl App {
         self.orphan_ports = self.collector.orphan_ports.clone();
         if self.selected >= self.sessions.len() && !self.sessions.is_empty() {
             self.selected = self.sessions.len() - 1;
+        }
+
+        // --- Status bar alerts on state transitions ---
+        let mut alert_msg: Option<String> = None;
+
+        for s in &self.sessions {
+            let key = (s.agent_cli.to_string(), s.session_id.clone());
+            if let Some(prev) = self.prev_states.get(&key) {
+                if matches!(prev, SessionStatus::Working) && matches!(s.status, SessionStatus::Waiting) {
+                    alert_msg = Some(format!("⏸ {} waiting for input", s.project_name));
+                }
+                if !matches!(prev, SessionStatus::Error(_)) && matches!(s.status, SessionStatus::Error(_)) {
+                    alert_msg = Some(format!("✗ {} hit an error", s.project_name));
+                }
+            }
+            self.prev_states.insert(key, s.status.clone());
+
+            // Context window >= 90% alert (one-shot with hysteresis at 85%)
+            if s.context_percent >= 90.0 {
+                if self.alerted_contexts.insert(s.session_id.clone()) {
+                    alert_msg = Some(format!("⚠ {} context at {:.0}%", s.project_name, s.context_percent));
+                }
+            } else if s.context_percent < 85.0 {
+                self.alerted_contexts.remove(&s.session_id);
+            }
+        }
+
+        if let Some(msg) = alert_msg {
+            self.set_status(msg);
         }
 
         // Compute rate as sum of per-session deltas (stable across session churn).
@@ -115,6 +153,21 @@ impl App {
             // Merge Codex rate limits from JSONL parsing (no extra I/O needed)
             if let Some(codex_rl) = self.collector.codex_rate_limit() {
                 self.rate_limits.push(codex_rl.clone());
+            }
+
+            // Rate limit threshold crossing (any 5h window crossing 80%)
+            let mut rl_alert: Option<String> = None;
+            for rl in &self.rate_limits {
+                if let Some(pct) = rl.five_hour_pct {
+                    let prev = self.prev_rate_pcts.get(&rl.source).copied().unwrap_or(0.0);
+                    if pct >= 80.0 && prev < 80.0 {
+                        rl_alert = Some(format!("⚠ {} rate limit at {:.0}%", rl.source, pct));
+                    }
+                    self.prev_rate_pcts.insert(rl.source.clone(), pct);
+                }
+            }
+            if let Some(msg) = rl_alert {
+                self.set_status(msg);
             }
         } else {
             self.rate_limit_counter += 1;
