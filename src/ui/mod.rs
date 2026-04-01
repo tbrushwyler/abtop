@@ -1053,6 +1053,7 @@ fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect) {
         let ctx_color = grad_at(&proc_grad, session.context_percent);
 
         let is_done = matches!(session.status, crate::model::SessionStatus::Done);
+        let is_error = matches!(session.status, crate::model::SessionStatus::Error(_));
         let row_style = if selected {
             Style::default()
                 .bg(SELECTED_BG)
@@ -1060,6 +1061,10 @@ fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD)
         } else if is_done {
             Style::default().fg(INACTIVE_FG)
+        } else if is_error || session.context_percent >= 90.0 {
+            Style::default().fg(grad_at(&proc_grad, 100.0))
+        } else if session.context_percent >= 80.0 {
+            Style::default().fg(grad_at(&proc_grad, 75.0))
         } else {
             Style::default()
         };
